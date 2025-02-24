@@ -1,26 +1,34 @@
-import { setScreenshotSrc, setUrl } from "#/state/browserSlice";
-import { addAssistantMessage, addUserMessage } from "#/state/chatSlice";
-import { setCode, setActiveFilepath } from "#/state/codeSlice";
-import { appendInput } from "#/state/commandSlice";
-import { appendJupyterInput } from "#/state/jupyterSlice";
-import { setRootTask } from "#/state/taskSlice";
+import {
+  addAssistantMessage,
+  addAssistantAction,
+  addUserMessage,
+  addErrorMessage,
+} from "#/state/chat-slice";
+import { trackError } from "#/utils/error-handler";
+import { appendSecurityAnalyzerInput } from "#/state/security-analyzer-slice";
+import { setCode, setActiveFilepath } from "#/state/code-slice";
+import { appendJupyterInput } from "#/state/jupyter-slice";
+import { setCurStatusMessage } from "#/state/status-slice";
 import store from "#/store";
-import ActionType from "#/types/ActionType";
-import { ActionMessage } from "#/types/Message";
-import { SocketMessage } from "#/types/ResponseType";
+import ActionType from "#/types/action-type";
+import {
+  ActionMessage,
+  ObservationMessage,
+  StatusMessage,
+} from "#/types/message";
 import { handleObservationMessage } from "./observations";
-import { getRootTask } from "./taskService";
+import { appendInput } from "#/state/command-slice";
 
 const messageActions = {
   [ActionType.BROWSE]: (message: ActionMessage) => {
-    const { url, screenshotSrc } = message.args;
-    store.dispatch(setUrl(url));
-    store.dispatch(setScreenshotSrc(screenshotSrc));
+    if (!message.args.thought && message.message) {
+      store.dispatch(addAssistantMessage(message.message));
+    }
   },
   [ActionType.BROWSE_INTERACTIVE]: (message: ActionMessage) => {
-    const { url, screenshotSrc } = message.args;
-    store.dispatch(setUrl(url));
-    store.dispatch(setScreenshotSrc(screenshotSrc));
+    if (!message.args.thought && message.message) {
+      store.dispatch(addAssistantMessage(message.message));
+    }
   },
   [ActionType.WRITE]: (message: ActionMessage) => {
     const { path, content } = message.args;
@@ -29,39 +37,50 @@ const messageActions = {
   },
   [ActionType.MESSAGE]: (message: ActionMessage) => {
     if (message.source === "user") {
-      store.dispatch(addUserMessage(message.args.content));
+      store.dispatch(
+        addUserMessage({
+          content: message.args.content,
+          imageUrls:
+            typeof message.args.image_urls === "string"
+              ? [message.args.image_urls]
+              : message.args.image_urls,
+          timestamp: message.timestamp,
+          pending: false,
+        }),
+      );
     } else {
       store.dispatch(addAssistantMessage(message.args.content));
     }
   },
-  [ActionType.FINISH]: (message: ActionMessage) => {
-    store.dispatch(addAssistantMessage(message.message));
-  },
-  [ActionType.RUN]: (message: ActionMessage) => {
-    if (message.args.thought) {
-      store.dispatch(addAssistantMessage(message.args.thought));
-    }
-    store.dispatch(appendInput(message.args.command));
-  },
   [ActionType.RUN_IPYTHON]: (message: ActionMessage) => {
-    if (message.args.thought) {
-      store.dispatch(addAssistantMessage(message.args.thought));
+    if (message.args.confirmation_state !== "rejected") {
+      store.dispatch(appendJupyterInput(message.args.code));
     }
-    store.dispatch(appendJupyterInput(message.args.code));
-  },
-  [ActionType.ADD_TASK]: () => {
-    getRootTask().then((fetchedRootTask) =>
-      store.dispatch(setRootTask(fetchedRootTask)),
-    );
-  },
-  [ActionType.MODIFY_TASK]: () => {
-    getRootTask().then((fetchedRootTask) =>
-      store.dispatch(setRootTask(fetchedRootTask)),
-    );
   },
 };
 
 export function handleActionMessage(message: ActionMessage) {
+  if (message.args?.hidden) {
+    return;
+  }
+
+  if (message.action === ActionType.RUN) {
+    store.dispatch(appendInput(message.args.command));
+  }
+
+  if ("args" in message && "security_risk" in message.args) {
+    store.dispatch(appendSecurityAnalyzerInput(message));
+  }
+
+  if (message.source === "agent") {
+    if (message.args && message.args.thought) {
+      store.dispatch(addAssistantMessage(message.args.thought));
+    }
+    // Need to convert ActionMessage to RejectAction
+    // @ts-expect-error TODO: fix
+    store.dispatch(addAssistantAction(message));
+  }
+
   if (message.action in messageActions) {
     const actionFn =
       messageActions[message.action as keyof typeof messageActions];
@@ -69,18 +88,45 @@ export function handleActionMessage(message: ActionMessage) {
   }
 }
 
-export function handleAssistantMessage(data: string | SocketMessage) {
-  let socketMessage: SocketMessage;
-
-  if (typeof data === "string") {
-    socketMessage = JSON.parse(data) as SocketMessage;
-  } else {
-    socketMessage = data;
+export function handleStatusMessage(message: StatusMessage) {
+  if (message.type === "info") {
+    store.dispatch(
+      setCurStatusMessage({
+        ...message,
+      }),
+    );
+  } else if (message.type === "error") {
+    trackError({
+      message: message.message,
+      source: "chat",
+      metadata: { msgId: message.id },
+    });
+    store.dispatch(
+      addErrorMessage({
+        ...message,
+      }),
+    );
   }
+}
 
-  if ("action" in socketMessage) {
-    handleActionMessage(socketMessage);
+export function handleAssistantMessage(message: Record<string, unknown>) {
+  if (message.action) {
+    handleActionMessage(message as unknown as ActionMessage);
+  } else if (message.observation) {
+    handleObservationMessage(message as unknown as ObservationMessage);
+  } else if (message.status_update) {
+    handleStatusMessage(message as unknown as StatusMessage);
   } else {
-    handleObservationMessage(socketMessage);
+    const errorMsg = "Unknown message type received";
+    trackError({
+      message: errorMsg,
+      source: "chat",
+      metadata: { raw_message: message },
+    });
+    store.dispatch(
+      addErrorMessage({
+        message: errorMsg,
+      }),
+    );
   }
 }

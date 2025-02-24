@@ -1,3 +1,0 @@
-Let's first view the content of the file `bad.txt` to identify the typos that need to be fixed.
-<execute_bash>
-cat bad.txt
